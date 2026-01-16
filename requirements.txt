@@ -1,0 +1,12 @@
+ultralytics
+pyside6
+opencv-python
+numpy
+pymongo
+folium
+geocoder
+pyobjc
+fpdf
+timm
+lap
+coremltools

@@ -1,0 +1,23 @@
+Mejor Epoca: 100
+
+epoch                     100.00000
+time                      79148.90000
+train/box_loss            0.34428
+train/seg_loss            0.18908
+train/cls_loss            0.19282
+train/dfl_loss            0.42588
+metrics/precision(B)      0.85648
+metrics/recall(B)         0.73081
+metrics/mAP50(B)          0.84466
+metrics/mAP50-95(B)       0.48959
+metrics/precision(M)      0.84947
+metrics/recall(M)         0.72342
+metrics/mAP50(M)          0.83453
+metrics/mAP50-95(M)       0.46848
+val/box_loss              0.14569
+val/seg_loss              0.07986
+val/cls_loss              0.09122
+val/dfl_loss              0.15845
+lr/pg0                    0.00010
+lr/pg1                    0.00010
+lr/pg2                    0.00010

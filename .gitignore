@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+venv/
+venv_coreml/
+venv_backup_py314/
+.env
+.ipynb_checkpoints/
+captures/
+*.mp4
+*.mov
+ Orden_Trabajo_Sesion.pdf
