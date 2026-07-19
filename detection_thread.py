@@ -2,8 +2,7 @@ import cv2
 import time
 import numpy as np
 import os
-from PySide6.QtCore import QThread, Signal, Qt
-from PySide6.QtGui import QImage
+import threading
 from ultralytics import YOLO
 import torch # Added import
 import sys
@@ -13,20 +12,24 @@ import os
 sys.path.append(os.getcwd())
 try:
     from edge_sensing_system.server.network.tcp_receiver import TCPFrameReceiver
+    from edge_sensing_system.server.network.record3d_receiver import Record3DReceiver
 except ImportError:
-    print("Warning: Could not import TCPFrameReceiver. Edge Sensing will not work.")
+    print("Warning: Could not import Receivers. Edge Sensing/Record3D will not work.")
 
-class DetectionThread(QThread):
-    change_pixmap_signal = Signal(object) # Changed to object
-    stats_signal = Signal(dict)
-    depth_signal = Signal(object) # New Signal for Depth Map
-
+class DetectionThread(threading.Thread):
     def __init__(self, model_path, camera_index=None, video_path=None, db=None, gps=None):
         super().__init__()
+        self.daemon = True
+        
+        # State for Web Server
+        self.latest_frame = None
+        self.latest_depth = None
+        self.latest_stats = {"fps": 0.0, "detections": 0, "vibration": 0.0, "depth_val": 0.0}
         self.model_path = model_path
         self.camera_index = camera_index 
         # Special flag for TCP Edge Sensor
         self.use_tcp = (self.camera_index == "tcp")
+        self.use_record3d = (self.camera_index == "record3d")
         
         self.video_path = video_path 
         self.db = db
@@ -49,7 +52,10 @@ class DetectionThread(QThread):
         self.depth_model = None
         self.depth_transform = None
         self.device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-        print(f"Dispositivo de Inferencia Profundidad: {self.device}")
+        self.device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        print(f"Depth Inference Device: {self.device}")
+        
+        self.current_fps = 0.0 # Store FPS for usage during detection
         
         # Ensure captures directory exists
         if not os.path.exists("captures"):
@@ -68,13 +74,13 @@ class DetectionThread(QThread):
 
     def load_depth_model(self):
         try:
-            print("Cargando MiDaS (LiDAR Simulado)...")
+            print("Loading MiDaS (Pseudo-LiDAR)...")
             self.depth_model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
             self.depth_model.to(self.device)
             self.depth_model.eval()
             midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
             self.depth_transform = midas_transforms.small_transform
-            print("Modelo de Profundidad cargado.")
+            print("Depth Model Loaded.")
         except Exception as e:
             print(f"Error cargando MiDaS: {e}")
             self.depth_model = None
@@ -98,10 +104,16 @@ class DetectionThread(QThread):
         tcp_receiver = None
         
         if self.use_tcp:
-            print("Iniciando Modo Servidor TCP (Edge Sensor)...")
+            print("Starting TCP Server Mode (Edge Sensor)...")
             tcp_receiver = TCPFrameReceiver()
             if not tcp_receiver.open():
                 print("Failed to start TCP Server")
+                return
+        elif self.use_record3d:
+            print("Starting Record3D USB Receiver...")
+            tcp_receiver = Record3DReceiver() # Re-using variable name for polymorphic receiver
+            if not tcp_receiver.open():
+                print("Failed to connect to Record3D app via USB")
                 return
         elif self.video_path:
             cap = cv2.VideoCapture(self.video_path)
@@ -123,24 +135,32 @@ class DetectionThread(QThread):
             cv_img = None
             
             if self.use_tcp:
-                # TCP Read (Returns ret, frame, depth_bytes)
-                ret, cv_img, depth_bytes = tcp_receiver.read()
+                # TCP Read (Returns ret, frame, depth_bytes, accel_data)
+                ret, cv_img, depth_bytes, accel_data = tcp_receiver.read()
                 if not ret:
                     # Non-blocking check or no client yet
                     # Create "Waiting" screen
                     wait_img = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(wait_img, "Esperando 'EdgeSensor'...", (180, 240), 
+                    cv2.putText(wait_img, "Waiting for 'EdgeSensor'...", (180, 240), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                     cv2.putText(wait_img, "IP: 192.168.1.53 Port: 5005", (190, 280), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
                     
-                    self.change_pixmap_signal.emit(self.convert_cv_qt(wait_img))
+                    self.latest_frame = self.encode_jpeg(wait_img)
                     time.sleep(0.1)
                     continue
+            elif self.use_record3d:
+                # Record3D Read (Returns ret, frame, depth_bytes, accel_data)
+                # Note: depth_bytes here is actually already a numpy array from our adapter
+                ret, cv_img, depth_bytes, accel_data = tcp_receiver.read()
+                if not ret:
+                     time.sleep(0.01)
+                     continue
             else:
                 # Standard CV2 Read
                 ret, cv_img = cap.read()
                 depth_bytes = None
+                accel_data = None
 
             if ret:
                 start_time = time.time()
@@ -155,30 +175,46 @@ class DetectionThread(QThread):
                 # --- DEPTH PROCESSING ---
                 if depth_bytes is not None:
                      # REAL LIDAR DATA (from iOS)
+                     if self.frame_count % 30 == 0:
+                         print(f"🔵 LiDAR ACTIVE | Payload: {len(depth_bytes)} bytes") # Debug Log
+                     
                      # iOS sends Float32 (4 bytes/pixel) usually, or Float16. 
                      # Given ARFrame.sceneDepth.depthMap consists of Float32 meters in ARKit
                      try:
-                         # Assume Float32 for now based on CVPixelBuffer extraction
-                         depth_arr = np.frombuffer(depth_bytes, dtype=np.float32)
-                         
-                         # Reshape: ARKit depth is usually smaller resolution (e.g. 256x192 or similar)
-                         # We need to know shape or infer it. 
-                         # For now, let's just attempt a common aspect ratio or reshape to known size if possible.
-                         # SAFEGUARD: If size doesn't match expected, skip.
-                         # A common LiDAR depth map is 256x192 (49152 pixels * 4 bytes = 196608 bytes)
-                         
-                         if depth_arr.size == 256 * 192:
-                             depth_out = depth_arr.reshape((192, 256))
-                         elif depth_arr.size == 640 * 480: # If it was resized
-                             depth_out = depth_arr.reshape((480, 640))
+                         # Check if already numpy (Record3D) or bytes (TCP)
+                         if isinstance(depth_bytes, np.ndarray):
+                            # If from pyrecord3d, it might be (H, W) already or flattened
+                            # Usually get_depth_frame() returns 2D array
+                            depth_out = depth_bytes # Assume it is already the depth map
+                            # Skip the reshape/decode logic below if already 2D
+                            if len(depth_out.shape) == 2:
+                                depth_arr = depth_out.flatten() # Just for legacy compatibility if valid
+                            else:
+                                depth_arr = depth_out.flatten()
                          else:
-                             # Fallback: Treat as 1D or try to guess?
-                             # Let's just create a square aspect approx if valid
-                             side = int(np.sqrt(depth_arr.size * (4/3)))
-                             if side * int(side*0.75) == depth_arr.size:
-                                 depth_out = depth_arr.reshape((int(side*0.75), side))
+                             # Assume Float32 for now based on CVPixelBuffer extraction
+                             depth_arr = np.frombuffer(depth_bytes, dtype=np.float32)
+                         
+                         # Reshape logic (Only if depth_out not already set or invalid shape)
+                         if depth_out is None or len(depth_out.shape) != 2:
+                             # Reshape: ARKit depth is usually smaller resolution (e.g. 256x192 or similar)
+                             # We need to know shape or infer it. 
+                             # For now, let's just attempt a common aspect ratio or reshape to known size if possible.
+                             # SAFEGUARD: If size doesn't match expected, skip.
+                             # A common LiDAR depth map is 256x192 (49152 pixels * 4 bytes = 196608 bytes)
+                             
+                             if depth_arr.size == 256 * 192:
+                                 depth_out = depth_arr.reshape((192, 256))
+                             elif depth_arr.size == 640 * 480: # If it was resized
+                                 depth_out = depth_arr.reshape((480, 640))
                              else:
-                                 depth_out = None # Unknown shape
+                                 # Fallback: Treat as 1D or try to guess?
+                                 # Let's just create a square aspect approx if valid
+                                 side = int(np.sqrt(depth_arr.size * (4/3)))
+                                 if side * int(side*0.75) == depth_arr.size:
+                                     depth_out = depth_arr.reshape((int(side*0.75), side))
+                                 else:
+                                     depth_out = None # Unknown shape
                          
                          if depth_out is not None:
                              # Normalize for Viz [0-255]
@@ -197,6 +233,9 @@ class DetectionThread(QThread):
 
                 elif self.depth_model:
                     # SIMULATED LIDAR (MiDaS)
+                    if self.frame_count % 30 == 0:
+                         print(f"🟠 NO LIDAR - Using AI Depth Estimation") # Debug Log
+
                     # Only run if NO real LiDAR and model loaded
                     run_depth = (self.frame_count % 5 == 0) or (self.last_depth_result is None)
                     
@@ -333,8 +372,8 @@ class DetectionThread(QThread):
                                       filename = f"captures/pothole_{track_id}_{int(current_time)}.jpg"
                                       cv2.imwrite(filename, cv_img) 
                                       
-                                      self.db.insert_pothole(lat, lon, conf, image_path=filename, size=current_size_m)
-                                      print(f"✅ BACHE GUARDADO! ID: {track_id} | {current_size_m}m | Conf: {conf:.2f}")
+                                      self.db.insert_pothole(lat, lon, conf, image_path=filename, size=current_size_m, fps=self.current_fps)
+                                      print(f"✅ POTHOLE SAVED! ID: {track_id} | {current_size_m}m | Conf: {conf:.2f} | FPS: {self.current_fps:.1f}")
                                       
                                       # Trigger Alert
                                       self.last_alert_time = 0 # Reset to force alert
@@ -346,6 +385,7 @@ class DetectionThread(QThread):
 
                 # Calculate FPS
                 fps = 1.0 / (time.time() - start_time)
+                self.current_fps = fps # Update for next frame/save
                 
                 # Stats
                 detections = len(results[0].boxes) if results[0].boxes else 0
@@ -373,8 +413,20 @@ class DetectionThread(QThread):
                      except Exception:
                          pass
                      self.prev_gray = curr_gray
+
+                # Override Vibration with Real Accelerometer if available
+                if accel_data:
+                    ax, ay, az = accel_data
+                    if self.frame_count % 30 == 0:
+                         print(f"🟢 ACCELEROMETER ACTIVE | g-force: {ax:.2f}, {ay:.2f}, {az:.2f}") # Debug Log
+
+                    # Magnitude in Gs
+                    mag = (ax**2 + ay**2 + az**2)**0.5
+                    # Simple deviation from 1.0 (Approx Gravity)
+                    vibration_metric = abs(mag - 1.0)
+                    stats["vibration"] = round(vibration_metric, 2)
                 
-                self.stats_signal.emit(stats)
+                self.latest_stats = stats
                 
                 # Apply Transparency (Blue Glow) at end of loop over detections
                 cv2.addWeighted(overlay, 0.4, annotated_frame, 0.6, 0, annotated_frame)
@@ -408,15 +460,12 @@ class DetectionThread(QThread):
                      except Exception:
                          pass
 
-                # Convert to Qt Image and emit
-                qt_img = self.convert_cv_qt(annotated_frame)
-                self.change_pixmap_signal.emit(qt_img)
+                # Encode to JPEG and save state
+                self.latest_frame = self.encode_jpeg(annotated_frame)
 
                 # Emit Depth Map Signal
                 if depth_colormap is not None:
-                    # Resize for display performance if needed
-                    # depth_small = cv2.resize(depth_colormap, (320, 240))
-                    self.depth_signal.emit(self.convert_cv_qt(depth_colormap))
+                    self.latest_depth = self.encode_jpeg(depth_colormap)
 
             else:
                 if self.video_path:
@@ -435,13 +484,12 @@ class DetectionThread(QThread):
     def stop(self):
         """Sets run flag to False and waits for thread to finish"""
         self._run_flag = False
-        self.wait()
+        self.join(timeout=2.0)
 
-    def convert_cv_qt(self, cv_img):
-        """Convert from an opencv image to QPixmap"""
-        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        p = convert_to_Qt_format.scaled(640, 480, Qt.KeepAspectRatio)
-        return p
+    def encode_jpeg(self, cv_img):
+        """Convert from an opencv image to JPEG bytes"""
+        resized = cv2.resize(cv_img, (640, 480))
+        ret, buffer = cv2.imencode('.jpg', resized)
+        if ret:
+            return buffer.tobytes()
+        return b''

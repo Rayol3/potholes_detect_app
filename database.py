@@ -27,7 +27,7 @@ class Database:
             print(f"Could not connect to MongoDB: {e}")
             self.client = None
 
-    def insert_pothole(self, lat, lon, confidence, image_path=None, size=None):
+    def insert_pothole(self, lat, lon, confidence, image_path=None, size=None, fps=None):
         if self.collection is None:
             return
         
@@ -41,7 +41,8 @@ class Database:
             "lon": lon,
             "confidence": float(confidence),
             "image_path": image_path,
-            "size_m": size
+            "size_m": size,
+            "fps": fps
         }
         try:
             self.collection.insert_one(doc)

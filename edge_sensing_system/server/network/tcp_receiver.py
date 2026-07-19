@@ -36,10 +36,10 @@ class TCPFrameReceiver:
     def read(self):
         """
         Mimics cv2.VideoCapture.read()
-        Returns: (ret, frame)
+        Returns: (ret, frame, depth_bytes, accel_data)
         """
         if not self.running:
-            return False, None, None
+            return False, None, None, None
 
         # Accept connection if not connected
         if not self.conn:
@@ -49,10 +49,10 @@ class TCPFrameReceiver:
                 self.is_connected = True
                 print(f"Connection from {addr}")
             except socket.timeout:
-                return False, None, None # No connection yet
+                return False, None, None, None # No connection yet
             except Exception as e:
                 print(f"Accept error: {e}")
-                return False, None, None
+                return False, None, None, None
 
         # Read Frame
         try:
@@ -64,16 +64,16 @@ class TCPFrameReceiver:
                 except socket.timeout:
                     if len(data) == 0:
                         # Timeout waiting for NEW packet (Idle) -> Keep connection, just return
-                        return False, None, None
+                        return False, None, None, None
                     else:
                         # Timeout IN THE MIDDLE of header -> Desync -> Close
                         print("Timeout receiving header")
                         self.close_client()
-                        return False, None, None
+                        return False, None, None, None
                 
                 if not packet:
                     self.close_client()
-                    return False, None, None
+                    return False, None, None, None
                 data += packet
             
             packed_msg_size = data
@@ -87,17 +87,17 @@ class TCPFrameReceiver:
                 except socket.timeout:
                     print("Timeout receiving payload")
                     self.close_client()
-                    return False, None, None
+                    return False, None, None, None
                     
                 if not packet: 
                     self.close_client()
-                    return False, None, None
+                    return False, None, None, None
                 data += packet
             
             # 3. Decode
-            # Structure: [ImageLen(4)][ImageBytes][DepthLen(4)][DepthBytes]
+            # Structure: [ImageLen(4)][ImageBytes][DepthLen(4)][DepthBytes][AccelLen(4)][AccelBytes]
             if len(data) < 4:
-                return False, None, None
+                return False, None, None, None
                 
             offset = 0
             
@@ -106,7 +106,7 @@ class TCPFrameReceiver:
             offset += 4
             
             if len(data) < offset + img_len:
-                return False, None, None
+                return False, None, None, None
                 
             image_bytes = data[offset:offset+img_len]
             offset += img_len
@@ -118,19 +118,30 @@ class TCPFrameReceiver:
                  offset += 4
                  if len(data) >= offset + depth_len:
                      depth_data = data[offset:offset+depth_len]
+                     offset += depth_len
+
+            # Accel Len
+            accel_data = None
+            if len(data) >= offset + 4:
+                 accel_len = struct.unpack(">L", data[offset:offset+4])[0]
+                 offset += 4
+                 if len(data) >= offset + accel_len:
+                     accel_bytes = data[offset:offset+accel_len]
+                     if len(accel_bytes) == 24: # Expecting 3 doubles (8 bytes each)
+                         accel_data = struct.unpack(">ddd", accel_bytes)
 
             nparr = np.frombuffer(image_bytes, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if frame is not None:
-                return True, frame, depth_data
+                return True, frame, depth_data, accel_data
             else:
-                return False, None, None
+                return False, None, None, None
                 
         except Exception as e:
             print(f"Receive error: {e}")
             self.close_client()
-            return False, None, None
+            return False, None, None, None
 
     def close_client(self):
         if self.conn:

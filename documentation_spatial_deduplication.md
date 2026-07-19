@@ -40,3 +40,5 @@ El flujo en `detection_thread.py` es el siguiente:
 5.  Si retorna `True`, se ignora.
 
 > **Nota:** Actualmente, en el código de prueba, esta verificación puede estar deshabilitada (`if True:`) para propósitos de depuración en patio, pero la arquitectura está diseñada para operar con el umbral mencionado.
+
+
